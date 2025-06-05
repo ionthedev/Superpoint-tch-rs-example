@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let matches = Command::new("SuperPoint Keypoint Detector")
         .version("0.1.0")
-        .author("Your Name")
+        .author("Brandon Friend")
         .about("Rust implementation of SuperPoint keypoint detection")
         .arg(
             Arg::new("input")
