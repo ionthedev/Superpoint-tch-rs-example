@@ -1,182 +1,213 @@
-use anyhow::{Result, anyhow};
-use image::{GenericImageView, RgbImage};
-use tch::{CModule, Device, IValue, Kind, TchError, Tensor};
+use clap::{Arg, ArgAction, Command};
+use image::GenericImageView;
+use log::info;
+use std::path::Path;
+use superpoint_rs::*;
 
-const IMAGE_HEIGHT: i64 = 240; // Set Height to 240
-const IMAGE_WIDTH: i64 = 320; // Set Width to 320
-// ============================
-const KEYPOINT_THRESHOLD: f64 = 0.05;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
 
-fn main() -> Result<()> {
-    // 1. Choose device: CPU or CUDA (if available)
-    let device = Device::cuda_if_available();
-    println!("Using device: {:?}", device);
-
-    // 2. Paths
-    let model_path = "./superpoint_v2.pt";
-    let input_image = "./input.png";
-    let output_image = "output_keypoints_fullres.png";
-
-    // 3. Load the TorchScript SuperPoint model
-    println!("Loading SuperPoint model from {}...", model_path);
-    let model = load_superpoint_model(model_path, device)?;
-    println!("Model loaded successfully.");
-
-    // 4. Preprocess the input image into a [1, 1, 240, 320] tensor
-    println!("Loading and preprocessing image {}...", input_image);
-    let input_tensor = load_and_preprocess(input_image, device)?;
-    println!(
-        "Image preprocessed successfully. Tensor shape: {:?}",
-        input_tensor.size()
-    );
-
-    // 5. Inference → get a [240, 320] heatmap
-    println!("Performing inference to get keypoint heatmap...");
-    let heatmap = infer_keypoints(&model, &input_tensor)?;
-    println!("Inference complete. Heatmap shape: {:?}", heatmap.size());
-
-    // 6. Extract (row, col) coordinates of keypoints in the 240×320 frame
-    println!("Extracting keypoint coordinates...");
-    let coords = get_keypoint_coords(&heatmap, KEYPOINT_THRESHOLD)?;
-    println!("Found {} keypoints.", coords.len());
-
-    // 7. Load the original full-resolution JPEG so we know its exact dims
-    println!("Loading original image for full-res drawing...");
-    let dyn_img = image::open(input_image).map_err(|e| {
-        anyhow!(
-            "Failed to open '{}' for full-res drawing: {}",
-            input_image,
-            e
+    let matches = Command::new("SuperPoint Keypoint Detector")
+        .version("0.1.0")
+        .author("Your Name")
+        .about("Rust implementation of SuperPoint keypoint detection")
+        .arg(
+            Arg::new("input")
+                .short('i')
+                .long("input")
+                .value_name("FILE")
+                .help("Input image path")
+                .required(true),
         )
-    })?;
-    let (orig_w, orig_h) = dyn_img.dimensions();
+        .arg(
+            Arg::new("output")
+                .short('o')
+                .long("output")
+                .value_name("FILE")
+                .help("Output image path")
+                .default_value("output_keypoints.png"),
+        )
+        .arg(
+            Arg::new("model")
+                .short('m')
+                .long("model")
+                .value_name("FILE")
+                .help("Path to SuperPoint model (.pt file)")
+                .default_value("./superpoint_v2.pt"),
+        )
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("FILE")
+                .help("Configuration file (TOML format)"),
+        )
+        .arg(
+            Arg::new("threshold")
+                .short('t')
+                .long("threshold")
+                .value_name("FLOAT")
+                .help("Keypoint detection threshold")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("max-keypoints")
+                .long("max-keypoints")
+                .value_name("INT")
+                .help("Maximum number of keypoints to detect")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("no-cuda")
+                .long("no-cuda")
+                .help("Disable CUDA acceleration")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("save-heatmap")
+                .long("save-heatmap")
+                .help("Save heatmap visualization")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("save-config")
+                .long("save-config")
+                .value_name("FILE")
+                .help("Save current configuration to file"),
+        )
+        .get_matches();
 
-    // 8. Scale each (row, col) from the 240×320 heatmap up to [0..orig_h, 0..orig_w]
-    let heat_w = IMAGE_WIDTH as u32; // 320
-    let heat_h = IMAGE_HEIGHT as u32; // 240
-    let scaled_coords: Vec<(i32, i32)> = coords
-        .iter()
-        .map(|&(row, col)| {
-            let x_full = ((col as f32) * (orig_w as f32) / (heat_w as f32)).round() as i32;
-            let y_full = ((row as f32) * (orig_h as f32) / (heat_h as f32)).round() as i32;
-            (x_full, y_full)
-        })
-        .collect();
+    // Load or create configuration
+    let mut config = if let Some(config_path) = matches.get_one::<String>("config") {
+        println!("Loading configuration from: {}", config_path);
+        Config::from_file(config_path)?
+    } else if Path::new("config.toml").exists() {
+        println!("Auto-detected config.toml, loading configuration...");
+        Config::from_file("config.toml")?
+    } else {
+        println!("Using default configuration");
+        Config::default()
+    };
 
-    // 9. Convert dyn_img into an editable RgbImage so we can draw on it
-    let mut fullres_rgb: RgbImage = dyn_img.to_rgb8();
+    // Print current configuration for debugging
+    println!("Configuration:");
+    println!("  Threshold: {}", config.keypoint.threshold);
+    println!("  Max keypoints: {:?}", config.keypoint.max_keypoints);
+    println!("  NMS radius: {:?}", config.keypoint.nms_radius);
+    println!("  Circle radius: {}", config.visualization.circle_radius);
 
-    // 10. Draw red circles (radius = 4) at each scaled coordinate
-    for &(x, y) in &scaled_coords {
-        if x >= 0 && y >= 0 && (x as u32) < orig_w && (y as u32) < orig_h {
-            fullres_rgb.put_pixel(x as u32, y as u32, image::Rgb([255, 0, 0]));
-        }
+    // Override config with command line arguments
+    if let Some(model_path) = matches.get_one::<String>("model") {
+        config.model.path = model_path.into();
     }
 
-    // 11. Save the full-res output
-    fullres_rgb
-        .save(output_image)
-        .map_err(|e| anyhow!("Failed to save full-res output '{}': {}", output_image, e))?;
-    println!(
-        "✅ Saved full-resolution keypoint visualization to {}",
-        output_image
-    );
+    if let Some(&threshold) = matches.get_one::<f64>("threshold") {
+        config.keypoint.threshold = threshold;
+    }
+
+    if let Some(&max_kpts) = matches.get_one::<usize>("max-keypoints") {
+        config.keypoint.max_keypoints = Some(max_kpts);
+    }
+
+    if matches.get_flag("no-cuda") {
+        config.model.use_cuda = false;
+    }
+
+    // Save configuration if requested
+    if let Some(save_path) = matches.get_one::<String>("save-config") {
+        config.to_file(save_path)?;
+        println!("Configuration saved to {}", save_path);
+    }
+
+    let input_path = matches.get_one::<String>("input").unwrap();
+    let output_path = matches.get_one::<String>("output").unwrap();
+
+    // Validate input file exists
+    if !Path::new(input_path).exists() {
+        eprintln!("Error: Input file '{}' does not exist", input_path);
+        std::process::exit(1);
+    }
+
+    // Validate model file exists
+    if !config.model.path.exists() {
+        eprintln!("Error: Model file '{:?}' does not exist", config.model.path);
+        std::process::exit(1);
+    }
+
+    info!("Starting SuperPoint keypoint detection");
+    info!("Input: {}", input_path);
+    info!("Output: {}", output_path);
+    info!("Model: {:?}", config.model.path);
+
+    // Run the detection pipeline
+    let result = run_detection(&config, input_path, output_path, matches.get_flag("save-heatmap"));
+
+    match result {
+        Ok(num_keypoints) => {
+            println!("✅ Successfully detected {} keypoints", num_keypoints);
+            println!("   Results saved to: {}", output_path);
+        }
+        Err(e) => {
+            eprintln!("❌ Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 
     Ok(())
 }
 
-fn load_superpoint_model(model_path: &str, device: Device) -> Result<CModule> {
-    let model = CModule::load_on_device(model_path, device)
-        .map_err(|e| anyhow!("Failed to load model '{}': {}", model_path, e))?;
-    Ok(model)
-}
+fn run_detection(
+    config: &Config,
+    input_path: &str,
+    output_path: &str,
+    save_heatmap: bool,
+) -> Result<usize, SuperPointError> {
+    // 1. Initialize components
+    info!("Initializing SuperPoint model...");
+    let model = SuperPointModel::new(config)?;
+    let device = model.device();
+    info!("Using device: {:?}", device);
 
-fn load_and_preprocess(image_path: &str, device: Device) -> Result<Tensor> {
-    let img_tensor =
-        tch::vision::imagenet::load_image_and_resize(image_path, IMAGE_WIDTH, IMAGE_HEIGHT)
-            .map_err(|e| anyhow!("Failed to load and resize image '{}': {}", image_path, e))?;
-    let gray_tensor = img_tensor.mean_dim(&[0i64] as &[i64], /*keepdim=*/ false, Kind::Float);
-    let input_tensor = gray_tensor.unsqueeze(0).unsqueeze(0).to_device(device);
-    Ok(input_tensor)
-}
+    let preprocessor = preprocessing::ImagePreprocessor::new(config.image.clone(), device);
+    let extractor = postprocessing::KeypointExtractor::new(config.keypoint.clone());
+    let visualizer = visualization::Visualizer::new(config.visualization.clone());
 
-fn infer_keypoints(model: &CModule, input_tensor: &Tensor) -> Result<Tensor> {
-    // 1. Run forward_is to get the raw IValue (handles multi-output)
-    let output_ival: IValue = model
-        .forward_is(&[IValue::Tensor(input_tensor.shallow_clone())])
-        .map_err(|e| anyhow!("Model inference failed via forward_is: {}", e))?; // :contentReference[oaicite:9]{index=9}
+    // 2. Load and preprocess image
+    info!("Loading and preprocessing image...");
+    let (input_tensor, original_image) = preprocessor.load_and_preprocess(input_path)?;
+    info!("Image preprocessed. Tensor shape: {:?}", input_tensor.size());
 
-    // 2. Extract the single “semi” heatmap tensor [1, 65, 30, 40] or [65, 30, 40]
-    let semi: Tensor = match output_ival {
-        IValue::Tuple(ref ivals) if ivals.len() >= 1 => match &ivals[0] {
-            IValue::Tensor(t0) => t0.shallow_clone(),
-            other => {
-                return Err(anyhow!(
-                    "Expected Tensor at tuple index 0, found: {:?}",
-                    other
-                ));
-            }
-        },
-        IValue::Tensor(t) => t.shallow_clone(),
-        other => {
-            return Err(anyhow!(
-                "Unexpected IValue from forward: {:?}. Expected Tensor or Tuple(Tensor,…).",
-                other
-            ));
-        }
-    };
+    // 3. Run inference
+    info!("Running SuperPoint inference...");
+    let heatmap = model.infer(&input_tensor)?;
+    info!("Inference complete. Heatmap shape: {:?}", heatmap.size());
 
-    // 3. Ensure shape is [65, 30, 40]. If it’s [1, 65, 30, 40], squeeze batch dim:
-    let semi = if semi.dim() == 4 && semi.size()[0] == 1 {
-        semi.squeeze_dim(0)
-    } else if semi.dim() == 3 {
-        semi
-    } else {
-        return Err(anyhow!(
-            "Unexpected semi-heatmap dims: {:?}. Expected [65, Hc, Wc].",
-            semi.size()
-        ));
-    };
+    // 4. Extract keypoints
+    info!("Extracting keypoints...");
+    let keypoints_model_space = extractor.extract_keypoints(&heatmap)?;
+    info!("Found {} keypoints in model space", keypoints_model_space.len());
 
-    // 4. Channel-wise softmax over dim=0 (65 channels → probability distribution)
-    let prob = semi.softmax(0, Kind::Float); // [65, 30, 40] :contentReference[oaicite:10]{index=10}
+    // 5. Scale keypoints to original image dimensions
+    let original_dims = original_image.dimensions();
+    let model_dims = (config.image.height, config.image.width);
+    let keypoints = extractor.scale_keypoints_to_original(
+        keypoints_model_space,
+        original_dims,
+        model_dims,
+    );
 
-    // 5. Slice off dustbin (last channel): keep channels 0..64 → shape [64, 30, 40]
-    let prob_cells = prob.narrow(0, 0, 64);
+    // 6. Create visualization
+    info!("Creating visualization...");
+    let result_image = visualizer.draw_keypoints_with_scores(&original_image, &keypoints)?;
+    result_image.save(output_path)?;
 
-    // 6. Depth-to-space: [64, 30, 40] → [8, 8, 30, 40]
-    let reshaped = prob_cells
-        .view((8, 8, 30, 40))
-        .permute(&[2i64, 0, 3, 1])
-        .contiguous()
-        .view((30 * 8, 40 * 8));
-
-    Ok(reshaped)
-}
-
-fn get_keypoint_coords(heatmap: &Tensor, threshold: f64) -> Result<Vec<(i64, i64)>> {
-    // 1. Create a tensor of same device as heatmap with the threshold value
-    let threshold_tensor = Tensor::from(threshold).to_device(heatmap.device());
-    // 2. Boolean mask of shape [H, W]
-    let mask = heatmap.gt_tensor(&threshold_tensor);
-
-    // 3. Get (row, col) indices of non-zero entries → Tensor [N, 2]
-    let nz_coords: Tensor = mask.nonzero();
-
-    // 4. Flatten [N, 2] → [2*N]
-    let flat_coords = nz_coords.contiguous().view((-1,));
-    // 5. Move to CPU and convert to Vec<i64>
-    let coords_flat: Vec<i64> =
-        Vec::<i64>::try_from(flat_coords.to_device(Device::Cpu)).map_err(|e: TchError| {
-            anyhow!("Failed to convert flattened coords tensor to Vec: {}", e)
-        })?;
-
-    // 6. Reconstruct Vec<(row, col)>
-    let mut coords = Vec::with_capacity(coords_flat.len() / 2);
-    for chunk in coords_flat.chunks_exact(2) {
-        let row = chunk[0];
-        let col = chunk[1];
-        coords.push((row, col));
+    // 7. Optionally save heatmap visualization
+    if save_heatmap {
+        let heatmap_path = format!("{}_heatmap.png", output_path.trim_end_matches(".png"));
+        info!("Saving heatmap visualization to {}...", heatmap_path);
+        let heatmap_vis = visualizer.create_heatmap_visualization(&heatmap)?;
+        heatmap_vis.save(&heatmap_path)?;
     }
-    Ok(coords)
+
+    Ok(keypoints.len())
 }

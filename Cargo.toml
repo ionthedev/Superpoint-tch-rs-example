@@ -8,3 +8,27 @@ anyhow = "1.0.98"
 image = "0.25.6"
 imageproc = "0.25.0"
 tch = { version = "0.20.0", features = ["download-libtorch"] }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+rayon = "1.10"
+
+# Fix for macOS library loading
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# Build configuration for better linking
+[profile.release]
+strip = false
+lto = false
+
+[lib]
+name = "superpoint_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "superpoint"
+path = "src/main.rs"

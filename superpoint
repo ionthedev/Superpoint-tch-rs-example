@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# SuperPoint Launcher Script
+# This ensures all required libraries are found
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Set library paths for macOS
+export DYLD_LIBRARY_PATH="$SCRIPT_DIR/target/release/deps:$DYLD_LIBRARY_PATH"
+export DYLD_FALLBACK_LIBRARY_PATH="/usr/local/lib:/opt/homebrew/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+
+# Check if OpenMP is available
+if [ ! -f "/usr/local/lib/libomp.dylib" ] && [ ! -f "/opt/homebrew/lib/libomp.dylib" ]; then
+    echo "⚠️  Warning: OpenMP not found. Install with: brew install libomp"
+    echo "   Trying to run anyway..."
+fi
+
+# Run the binary
+exec "$SCRIPT_DIR/target/release/superpoint" "$@" 

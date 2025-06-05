@@ -1,0 +1,21 @@
+# SuperPoint Configuration File
+# This file demonstrates all available configuration options
+
+[model]
+path = "./superpoint_v2.pt"
+use_cuda = true
+
+[image]
+width = 320
+height = 240
+normalize = true
+
+[keypoint]
+threshold = 0.05
+max_keypoints = 1000
+nms_radius = 4.0
+
+[visualization]
+circle_radius = 1
+circle_color = [0, 255, 0]  # RGB: Red
+line_thickness = 2 
